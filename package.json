@@ -1,0 +1,12 @@
+{
+  "name": "tenderiq-facebook-autoposter",
+  "version": "1.0.0",
+  "description": "Posts one scheduled update per day to a Facebook Page via GitHub Actions.",
+  "type": "commonjs",
+  "main": "poster.js",
+  "scripts": {
+    "post": "node poster.js",
+    "dry-run": "node dry-run.js"
+  },
+  "license": "MIT"
+}
