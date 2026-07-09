@@ -132,14 +132,6 @@ async function commitPostsFile(fileContents, message) {
 }
 
 async function main() {
-  // Validate required Facebook env vars up front.
-  const missing = ['FACEBOOK_PAGE_ID', 'FACEBOOK_PAGE_ACCESS_TOKEN'].filter(
-    (k) => !process.env[k]
-  );
-  if (missing.length) {
-    throw new Error(`Missing required env vars: ${missing.join(', ')}`);
-  }
-
   const data = JSON.parse(fs.readFileSync(POSTS_FILE, 'utf8'));
   let index = data.last_posted_index || 0;
 
@@ -163,6 +155,14 @@ async function main() {
         'Fill in posts.json and re-run.'
     );
     return;
+  }
+
+  // Content is real — now the Facebook credentials are required.
+  const missing = ['FACEBOOK_PAGE_ID', 'FACEBOOK_PAGE_ACCESS_TOKEN'].filter(
+    (k) => !process.env[k]
+  );
+  if (missing.length) {
+    throw new Error(`Missing required env vars: ${missing.join(', ')}`);
   }
 
   // Post to Facebook.
