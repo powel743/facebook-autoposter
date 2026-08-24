@@ -19,13 +19,17 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
       - name: Run poster
         run: node poster.js
         env:
           FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+          # Optional but recommended: enables poster.js's pre-flight token
+          # expiry check. Omit both to skip the check silently.
+          FACEBOOK_APP_ID: ${{ secrets.FACEBOOK_APP_ID }}
+          FACEBOOK_APP_SECRET: ${{ secrets.FACEBOOK_APP_SECRET }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}

@@ -7,72 +7,142 @@
  * via the Graph API, then increments the index and commits posts.json back to
  * the repo using the GitHub Contents API. Loops back to 0 after day 30.
  *
- * Uses only Node.js built-ins (https, fs) — no external dependencies.
+ * Supports two post types, chosen automatically per-day based on posts.json:
+ *   - Text-only post    -> POST /{page-id}/feed
+ *   - Text + image post -> POST /{page-id}/photos (local binary file upload,
+ *     e.g. a Fable-generated poster concept saved under posters/)
+ *
+ * Uses only Node.js built-ins (fetch, FormData, fs, path — all global since
+ * Node 18, no npm install required).
  *
  * Required env vars:
  *   FACEBOOK_PAGE_ID            - the numeric id of the Facebook Page to post to
  *   FACEBOOK_PAGE_ACCESS_TOKEN  - a Page access token (pages_manage_posts scope)
  *   GITHUB_TOKEN                - token to commit the updated posts.json
  *   GITHUB_REPOSITORY           - "owner/repo" (provided by GitHub Actions)
- *   GITHUB_SHA                  - the commit SHA being run (provided by Actions)
- *   GITHUB_BRANCH               - defaults to "main"
+ *   GITHUB_BRANCH                - defaults to "main"
+ *
+ * Optional env vars (enable the pre-flight token health check):
+ *   FACEBOOK_APP_ID
+ *   FACEBOOK_APP_SECRET
  */
 
-const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
 const POSTS_FILE = path.join(__dirname, 'posts.json');
 const PLACEHOLDER = 'PLACEHOLDER';
 const TOTAL_DAYS = 30;
-const GRAPH_API_VERSION = 'v21.0';
+const GRAPH_API_VERSION = 'v25.0'; // bumped from v21.0 — see README "Token & version maintenance"
+const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
+const TOKEN_EXPIRY_WARNING_DAYS = 7;
 
 const {
   FACEBOOK_PAGE_ID,
   FACEBOOK_PAGE_ACCESS_TOKEN,
+  FACEBOOK_APP_ID,
+  FACEBOOK_APP_SECRET,
   GITHUB_TOKEN,
   GITHUB_REPOSITORY,
   GITHUB_BRANCH = 'main',
 } = process.env;
 
-/** Minimal promise wrapper around https.request that returns { status, body }. */
-function httpRequest(options, payload) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => resolve({ status: res.statusCode, body: data }));
-    });
-    req.on('error', reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
+/**
+ * Pre-flight check: verify the Page access token is valid and warn if it's
+ * close to expiring. Uses the /debug_token endpoint. Requires FACEBOOK_APP_ID
+ * and FACEBOOK_APP_SECRET — if either is missing, the check is skipped
+ * (poster.js still works, you just lose the early warning).
+ */
+async function checkTokenHealth() {
+  if (!FACEBOOK_APP_ID || !FACEBOOK_APP_SECRET) {
+    console.log(
+      'ℹ️  FACEBOOK_APP_ID/FACEBOOK_APP_SECRET not set — skipping token expiry check.'
+    );
+    return;
+  }
+
+  const appToken = `${FACEBOOK_APP_ID}|${FACEBOOK_APP_SECRET}`;
+  const url = new URL(`${GRAPH_BASE}/debug_token`);
+  url.searchParams.set('input_token', FACEBOOK_PAGE_ACCESS_TOKEN);
+  url.searchParams.set('access_token', appToken);
+
+  const res = await fetch(url);
+  const body = await res.json();
+
+  if (!res.ok) {
+    throw new Error(
+      `Token health check failed (${res.status}): ${JSON.stringify(body)}. ` +
+        'The Page access token is likely invalid or expired — regenerate it (see README § Token expiry).'
+    );
+  }
+
+  const data = body.data;
+  if (!data || data.is_valid === false) {
+    throw new Error(
+      `Facebook reports this Page access token is invalid: ${JSON.stringify(data)}. ` +
+        'Regenerate it (see README § Token expiry) and update the FACEBOOK_PAGE_ACCESS_TOKEN secret.'
+    );
+  }
+
+  if (data.expires_at && data.expires_at > 0) {
+    const expiresAt = new Date(data.expires_at * 1000);
+    const daysLeft = (expiresAt.getTime() - Date.now()) / (1000 * 60 * 60 * 24);
+    console.log(`🔑 Page token expires: ${expiresAt.toISOString()} (${daysLeft.toFixed(1)} days left).`);
+    if (daysLeft <= TOKEN_EXPIRY_WARNING_DAYS) {
+      console.warn(
+        `⚠️  Page token expires in ${daysLeft.toFixed(
+          1
+        )} days. Run 'node exchange-token.js' to generate a fresh long-lived token before it breaks.`
+      );
+    }
+  } else {
+    console.log('🔑 Page token has no expiry (long-lived / never-expiring). ✅');
+  }
 }
 
-/** Publish a text post to the Facebook Page feed via the Graph API. */
-async function postToFacebook(content) {
-  const payload = new URLSearchParams({
-    message: content,
-    access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
-  }).toString();
+/** Publish a text-only post to the Facebook Page feed via the Graph API. */
+async function postTextToFacebook(content) {
+  const url = new URL(`${GRAPH_BASE}/${FACEBOOK_PAGE_ID}/feed`);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      message: content,
+      access_token: FACEBOOK_PAGE_ACCESS_TOKEN,
+    }),
+  });
 
-  const { status, body } = await httpRequest(
-    {
-      hostname: 'graph.facebook.com',
-      path: `/${GRAPH_API_VERSION}/${FACEBOOK_PAGE_ID}/feed`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(payload),
-      },
-    },
-    payload
-  );
-
-  if (status < 200 || status >= 300) {
-    throw new Error(`Facebook API returned ${status}: ${body}`);
+  const body = await res.json();
+  if (!res.ok) {
+    throw new Error(`Facebook API returned ${res.status}: ${JSON.stringify(body)}`);
   }
-  return JSON.parse(body);
+  return body;
+}
+
+/**
+ * Publish a post with an attached image to the Facebook Page via the Graph
+ * API, uploading a local binary file (e.g. a Fable-generated poster) as
+ * multipart/form-data to POST /{page-id}/photos.
+ */
+async function postPhotoToFacebook(content, imagePath) {
+  if (!fs.existsSync(imagePath)) {
+    throw new Error(`Image file not found: ${imagePath}`);
+  }
+
+  const fileBuffer = fs.readFileSync(imagePath);
+  const form = new FormData();
+  form.set('caption', content);
+  form.set('access_token', FACEBOOK_PAGE_ACCESS_TOKEN);
+  form.set('source', new Blob([fileBuffer]), path.basename(imagePath));
+
+  const url = new URL(`${GRAPH_BASE}/${FACEBOOK_PAGE_ID}/photos`);
+  const res = await fetch(url, { method: 'POST', body: form });
+
+  const body = await res.json();
+  if (!res.ok) {
+    throw new Error(`Facebook API returned ${res.status}: ${JSON.stringify(body)}`);
+  }
+  return body;
 }
 
 /** Commit the updated posts.json back to the repo via the GitHub Contents API. */
@@ -84,7 +154,7 @@ async function commitPostsFile(fileContents, message) {
     return;
   }
 
-  const apiPath = `/repos/${GITHUB_REPOSITORY}/contents/posts.json`;
+  const apiPath = `https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/posts.json`;
   const baseHeaders = {
     Authorization: `Bearer ${GITHUB_TOKEN}`,
     'User-Agent': 'facebook-autoposter',
@@ -92,42 +162,28 @@ async function commitPostsFile(fileContents, message) {
   };
 
   // 1. Get the current file SHA (required to update an existing file).
-  const getRes = await httpRequest({
-    hostname: 'api.github.com',
-    path: `${apiPath}?ref=${encodeURIComponent(GITHUB_BRANCH)}`,
-    method: 'GET',
+  const getRes = await fetch(`${apiPath}?ref=${encodeURIComponent(GITHUB_BRANCH)}`, {
     headers: baseHeaders,
   });
-
-  if (getRes.status < 200 || getRes.status >= 300) {
-    throw new Error(`GitHub get-file returned ${getRes.status}: ${getRes.body}`);
+  const getBody = await getRes.json();
+  if (!getRes.ok) {
+    throw new Error(`GitHub get-file returned ${getRes.status}: ${JSON.stringify(getBody)}`);
   }
-  const sha = JSON.parse(getRes.body).sha;
 
   // 2. Commit the new contents.
-  const payload = JSON.stringify({
-    message,
-    content: Buffer.from(fileContents).toString('base64'),
-    sha,
-    branch: GITHUB_BRANCH,
+  const putRes = await fetch(apiPath, {
+    method: 'PUT',
+    headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message,
+      content: Buffer.from(fileContents).toString('base64'),
+      sha: getBody.sha,
+      branch: GITHUB_BRANCH,
+    }),
   });
-
-  const putRes = await httpRequest(
-    {
-      hostname: 'api.github.com',
-      path: apiPath,
-      method: 'PUT',
-      headers: {
-        ...baseHeaders,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-      },
-    },
-    payload
-  );
-
-  if (putRes.status < 200 || putRes.status >= 300) {
-    throw new Error(`GitHub commit returned ${putRes.status}: ${putRes.body}`);
+  const putBody = await putRes.json();
+  if (!putRes.ok) {
+    throw new Error(`GitHub commit returned ${putRes.status}: ${JSON.stringify(putBody)}`);
   }
 }
 
@@ -146,6 +202,7 @@ async function main() {
   console.log('──────────────────────────────────────────────');
   console.log(`📅 Day ${post.day} (index ${index}) — ${post.theme}`);
   console.log(`📝 Content:\n${post.content}`);
+  if (post.image) console.log(`🖼️  Image: ${post.image}`);
   console.log('──────────────────────────────────────────────');
 
   // Skip if content still contains the placeholder marker.
@@ -165,10 +222,21 @@ async function main() {
     throw new Error(`Missing required env vars: ${missing.join(', ')}`);
   }
 
-  // Post to Facebook.
+  console.log('🩺 Checking Page access token health...');
+  await checkTokenHealth();
+
+  // Post to Facebook — image post if posts.json specifies one, else text-only.
   console.log('🚀 Posting to Facebook...');
-  const result = await postToFacebook(post.content);
-  const postId = result.id;
+  let result;
+  if (post.image) {
+    const imagePath = path.join(__dirname, post.image);
+    result = await postPhotoToFacebook(post.content, imagePath);
+  } else {
+    result = await postTextToFacebook(post.content);
+  }
+
+  // /feed returns { id }, /photos returns { id, post_id }.
+  const postId = result.post_id || result.id;
   const postUrl = `https://www.facebook.com/${postId}`;
   console.log(`✅ Successfully posted day ${post.day} to Facebook.`);
   console.log(`🆔 post_id: ${postId}`);
