@@ -6,7 +6,12 @@
   "main": "poster.js",
   "scripts": {
     "post": "node poster.js",
-    "dry-run": "node dry-run.js"
+    "dry-run": "node dry-run.js",
+    "exchange-token": "node exchange-token.js",
+    "test": "node test/run-integration-test.js text && node test/run-integration-test.js photo"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "license": "MIT"
 }

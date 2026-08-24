@@ -53,7 +53,8 @@
     {
       "day": 11,
       "content": "PLACEHOLDER - Day 11 (Product reveal) post content goes here. Replace this text before going live.",
-      "theme": "Product reveal"
+      "theme": "Product reveal",
+      "image": "posters/day-11.png"
     },
     {
       "day": 12,
